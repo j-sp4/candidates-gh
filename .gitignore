@@ -1,0 +1,12 @@
+.venv/
+.env
+__pycache__/
+*.csv
+github_data/
+github_data_2/
+**/node_modules/
+**/.next/
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
