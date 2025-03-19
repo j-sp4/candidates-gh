@@ -8,6 +8,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from pathlib import Path
 from datetime import datetime
+import logging
+import sys
 
 app = FastAPI(title="GitHub Data Dashboard API")
 
@@ -19,6 +21,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Configure logging (if not already configured)
+logging.basicConfig(level=logging.INFO)
 
 # Models
 class Repository(BaseModel):
@@ -60,7 +65,7 @@ class DashboardStats(BaseModel):
 # Helper functions
 def get_latest_data_files() -> Dict[str, Path]:
     """Get the latest data files from the github_data directory."""
-    data_dir = Path("github_data")
+    data_dir = Path("github_data_2")
     if not data_dir.exists():
         raise HTTPException(status_code=404, detail="No data directory found")
     
@@ -96,6 +101,15 @@ def get_latest_data_files() -> Dict[str, Path]:
 
 def read_csv_file(file_path: Path) -> List[Dict[str, Any]]:
     """Read a CSV file and return its contents as a list of dictionaries."""
+    # Increase CSV field size limit to handle very large fields
+    max_field_limit = sys.maxsize
+    while True:
+        try:
+            csv.field_size_limit(max_field_limit)
+            break
+        except OverflowError:
+            max_field_limit = int(max_field_limit / 10)
+
     if not file_path.exists():
         return []
     
@@ -105,14 +119,17 @@ def read_csv_file(file_path: Path) -> List[Dict[str, Any]]:
         for row in reader:
             # Process special fields
             for key, value in row.items():
-                if key in ["topics", "languages"] and value:
-                    try:
-                        row[key] = json.loads(value)
-                    except json.JSONDecodeError:
+                if key in ["topics", "languages"]:
+                    if value in [None, "", "None", "null"]:
                         row[key] = []
+                    else:
+                        try:
+                            row[key] = json.loads(value)
+                        except json.JSONDecodeError:
+                            row[key] = []
                 elif key in ["stargazers_count", "forks_count", "watchers_count", 
-                           "open_issues_count", "size", "id", "contributions",
-                           "followers", "following", "public_repos", "public_gists"]:
+                             "open_issues_count", "size", "id", "contributions",
+                             "followers", "following", "public_repos", "public_gists"]:
                     try:
                         row[key] = int(value) if value else 0
                     except ValueError:
@@ -172,52 +189,42 @@ async def get_repositories(
         raise HTTPException(status_code=500, detail=f"Error fetching repositories: {str(e)}")
 
 @app.get("/api/contributors", response_model=List[Contributor])
-async def get_contributors(
-    username: Optional[str] = None,
-    repository: Optional[str] = None,
-    min_contributions: Optional[int] = None,
-    min_followers: Optional[int] = None,
-    limit: int = Query(100, ge=1, le=1000)
-):
-    """Get contributors with optional filtering."""
+async def get_contributors(limit: int = 20) -> List[Contributor]:
+    """Get a list of contributors with flattened repository contributions."""
     try:
         files = get_latest_data_files()
-        contributors = read_csv_file(files["contributors"])
+        contributors_data = read_csv_file(files["contributors"])
+        flattened_contributors: List[Dict[str, Any]] = []
         
-        # Apply filters
-        if username:
-            contributors = [
-                contrib for contrib in contributors 
-                if username.lower() in (contrib.get("username") or "").lower()
-            ]
+        for row in contributors_data:
+            # Process the 'repository_contributions' field to extract required values.
+            repo_contribs = []
+            if "repository_contributions" in row and row["repository_contributions"]:
+                try:
+                    repo_contribs = json.loads(row["repository_contributions"])
+                except json.JSONDecodeError:
+                    repo_contribs = []
+            
+            if repo_contribs:
+                # Use the first repository contribution as the primary one.
+                primary = repo_contribs[0]
+                row["contributions"] = int(primary.get("contributions", 0))
+                row["repository"] = primary.get("repository", "")
+                row["repository_stars"] = int(primary.get("repository_stars", 0))
+            else:
+                row["contributions"] = 0
+                row["repository"] = ""
+                row["repository_stars"] = 0
+            
+            flattened_contributors.append(row)
         
-        if repository:
-            contributors = [
-                contrib for contrib in contributors 
-                if repository.lower() in (contrib.get("repository") or "").lower()
-            ]
-        
-        if min_contributions is not None:
-            contributors = [
-                contrib for contrib in contributors 
-                if contrib.get("contributions", 0) >= min_contributions
-            ]
-        
-        if min_followers is not None:
-            contributors = [
-                contrib for contrib in contributors 
-                if contrib.get("followers", 0) >= min_followers
-            ]
-        
-        # Sort by contributions (descending)
-        contributors.sort(key=lambda x: x.get("contributions", 0), reverse=True)
-        
-        return contributors[:limit]
+        return flattened_contributors[:limit]
     
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching contributors: {str(e)}")
+        logging.exception("Error fetching contributors")
+        raise HTTPException(status_code=500, detail=f"Error fetching contributors: {e}")
 
 @app.get("/api/stats", response_model=DashboardStats)
 async def get_dashboard_stats():
@@ -243,17 +250,40 @@ async def get_dashboard_stats():
             for lang, count in sorted(languages_count.items(), key=lambda x: x[1], reverse=True)
         ][:10]
         
-        # Aggregate topics
+        # Aggregate topics with enhanced type checking and logging
         topics_count = {}
         for repo in repositories:
-            topics = repo.get("topics", [])
-            if isinstance(topics, str):
+            raw_topics = repo.get("topics")
+            cleaned_topics = []
+            if raw_topics is None:
+                cleaned_topics = []
+            elif isinstance(raw_topics, list):
+                cleaned_topics = raw_topics
+            elif isinstance(raw_topics, str):
                 try:
-                    topics = json.loads(topics)
+                    parsed = json.loads(raw_topics)
+                    if isinstance(parsed, list):
+                        cleaned_topics = parsed
+                    else:
+                        cleaned_topics = []
+                        logging.warning(
+                            "Repository %s: topics after JSON parsing is not a list: %s",
+                            repo.get("id"), parsed
+                        )
                 except json.JSONDecodeError:
-                    topics = []
+                    cleaned_topics = []
+                    logging.warning(
+                        "Repository %s: failed to decode topics JSON from: %s",
+                        repo.get("id"), raw_topics
+                    )
+            else:
+                cleaned_topics = []
+                logging.warning(
+                    "Repository %s: topics has unexpected type %s: %s",
+                    repo.get("id"), type(raw_topics), raw_topics
+                )
             
-            for topic in topics:
+            for topic in cleaned_topics:
                 topics_count[topic] = topics_count.get(topic, 0) + 1
         
         top_topics = [
@@ -293,6 +323,7 @@ async def get_dashboard_stats():
     except HTTPException:
         raise
     except Exception as e:
+        logging.exception("Error fetching dashboard stats")
         raise HTTPException(status_code=500, detail=f"Error fetching dashboard stats: {str(e)}")
 
 @app.get("/api/contributors/multi-repo", response_model=List[Dict[str, Any]])
@@ -468,6 +499,11 @@ async def get_extended_stats():
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching extended stats: {str(e)}")
+
+@app.api_route("/api/health", methods=["GET", "HEAD"])
+async def health_check():
+    """Health check endpoint to verify API is running"""
+    return {"status": "ok", "timestamp": datetime.now().isoformat()}
 
 if __name__ == "__main__":
     import uvicorn
