@@ -5,11 +5,12 @@ from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pathlib import Path
 from datetime import datetime
 import logging
 import sys
+import requests
 
 app = FastAPI(title="GitHub Data Dashboard API")
 
@@ -42,17 +43,27 @@ class Repository(BaseModel):
 
 class Contributor(BaseModel):
     username: str
-    contributions: int
-    repository: str
-    repository_stars: int
     name: Optional[str] = None
     company: Optional[str] = None
+    blog: Optional[str] = None
     location: Optional[str] = None
     email: Optional[str] = None
+    bio: Optional[str] = None
     twitter_username: Optional[str] = None
-    followers: Optional[int] = None
     public_repos: Optional[int] = None
+    public_gists: Optional[int] = None
+    followers: Optional[int] = None
+    following: Optional[int] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
     html_url: Optional[str] = None
+    account_type: Optional[str] = Field(None, alias="type")
+    site_admin: Optional[bool] = None
+    total_contributions: int
+    repository_contributions: List[Dict[str, Any]] = []
+    
+    class Config:
+        allow_population_by_field_name = True
 
 class DashboardStats(BaseModel):
     total_repositories: int
@@ -99,46 +110,71 @@ def get_latest_data_files() -> Dict[str, Path]:
     
     return files
 
-def read_csv_file(file_path: Path) -> List[Dict[str, Any]]:
-    """Read a CSV file and return its contents as a list of dictionaries."""
-    # Increase CSV field size limit to handle very large fields
-    max_field_limit = sys.maxsize
-    while True:
-        try:
-            csv.field_size_limit(max_field_limit)
-            break
-        except OverflowError:
-            max_field_limit = int(max_field_limit / 10)
-
-    if not file_path.exists():
-        return []
-    
-    data = []
-    with open(file_path, 'r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            # Process special fields
-            for key, value in row.items():
-                if key in ["topics", "languages"]:
-                    if value in [None, "", "None", "null"]:
-                        row[key] = []
-                    else:
+def read_csv_file(file_path: str) -> List[Dict[str, Any]]:
+    """Read a CSV file and return a list of dictionaries."""
+    try:
+        # Increase CSV field size limit to handle very large fields
+        max_field_limit = sys.maxsize
+        while True:
+            try:
+                csv.field_size_limit(max_field_limit)
+                break
+            except OverflowError:
+                max_field_limit = int(max_field_limit / 10)
+        
+        with open(file_path, 'r', encoding='utf-8') as f:
+            # Get the header row
+            reader = csv.reader(f)
+            header = next(reader)
+            
+            # Log the headers for debugging
+            logging.info(f"CSV headers for {file_path}: {header}")
+            
+            # Normalize header names
+            normalized_header = []
+            for field in header:
+                field_name = field.strip().lower().replace(' ', '_')
+                
+                normalized_header.append(field_name)
+            
+            # Read the data
+            data = []
+            for row in reader:
+                if len(row) != len(normalized_header):
+                    # Skip malformed rows
+                    logging.warning(f"Skipping malformed row: {row}")
+                    continue
+                    
+                item = {}
+                for i, field in enumerate(normalized_header):
+                    # Handle empty values
+                    value = row[i].strip() if i < len(row) else ""
+                    
+                    # Try to convert numeric values
+                    if field in ["total_contributions", "followers", "public_repos", "stargazers_count", "forks_count"]:
                         try:
-                            row[key] = json.loads(value)
-                        except json.JSONDecodeError:
-                            row[key] = []
-                elif key in ["stargazers_count", "forks_count", "watchers_count", 
-                             "open_issues_count", "size", "id", "contributions",
-                             "followers", "following", "public_repos", "public_gists"]:
-                    try:
-                        row[key] = int(value) if value else 0
-                    except ValueError:
-                        row[key] = 0
-                elif value == "None" or value == "null":
-                    row[key] = None
-            data.append(row)
-    
-    return data
+                            value = int(value) if value else 0
+                        except ValueError:
+                            value = 0
+                    
+                    item[field] = value
+                
+                # Special handling for contributions
+                # Check if there's any field that might contain contribution data
+                # for i, field_name in enumerate(normalized_header):
+                #     if 'contribution' in field_name and row[i].strip():
+                #         try:
+                #             item['contributions'] = int(row[i].strip())
+                #             break
+                #         except ValueError:
+                #             pass
+                
+                data.append(item)
+            
+            return data
+    except Exception as e:
+        logging.error(f"Error reading CSV file {file_path}: {e}")
+        raise
 
 # API Routes
 @app.get("/")
@@ -354,7 +390,7 @@ async def get_multi_repo_contributors(min_repos: int = 2):
                 }
             
             contributor_repos[username]["repositories"].add(repo)
-            contributor_repos[username]["total_contributions"] += int(contrib.get("contributions", 0))
+            # contributor_repos[username]["total_contributions"] += int(contrib.get("contributions", 0))
         
         # Filter contributors with multiple repositories
         multi_repo_contributors = [
@@ -403,7 +439,7 @@ async def get_contributors_by_location():
                     "username": username,
                     "name": contrib.get("name", ""),
                     "followers": contrib.get("followers", 0),
-                    "contributions": contrib.get("contributions", 0),
+                    "total_contributions": contrib.get("total_contributions", 0),
                     "repository": contrib.get("repository", ""),
                     "html_url": contrib.get("html_url", "")
                 })
@@ -504,6 +540,681 @@ async def get_extended_stats():
 async def health_check():
     """Health check endpoint to verify API is running"""
     return {"status": "ok", "timestamp": datetime.now().isoformat()}
+
+@app.get("/api/candidates", response_model=Dict[str, Any])
+async def get_candidates(
+    sort_by: str = Query("total_contributions", description="Field to sort by"),
+    sort_order: str = Query("desc", description="Sort order (asc or desc)"),
+    page: int = Query(1, description="Page number"),
+    page_size: int = Query(20, description="Number of results per page"),
+    location: Optional[str] = Query(None, description="Filter by location"),
+    language: Optional[str] = Query(None, description="Filter by programming language"),
+    min_followers: Optional[int] = Query(None, description="Minimum number of followers"),
+    min_contributions: Optional[int] = Query(None, description="Minimum number of contributions")
+):
+    """Get candidates (contributors) with sorting and filtering options."""
+    try:
+        contributors_data = read_csv_file(get_latest_data_files()["contributors"])
+        
+        # Map column names to standardized names
+        for contributor in contributors_data:
+            # Map repository_contributions to contributions if it exists
+            # if "repository_contributions" in contributor and not contributor.get("contributions"):
+            #     contributor["contributions"] = contributor["repository_contributions"]
+            
+            # Ensure contributions is an integer
+            try:
+                contributor["total_contributions"] = int(contributor.get("total_contributions", 0))
+            except (ValueError, TypeError):
+                contributor["total_contributions"] = 0
+                
+            # Ensure followers is an integer
+            try:
+                contributor["followers"] = int(contributor.get("followers", 0))
+            except (ValueError, TypeError):
+                contributor["followers"] = 0
+                
+            # Ensure public_repos is an integer
+            try:
+                contributor["public_repos"] = int(contributor.get("public_repos", 0))
+            except (ValueError, TypeError):
+                contributor["public_repos"] = 0
+        
+        # Apply filters
+        filtered_contributors = contributors_data
+        
+        if location:
+            filtered_contributors = [
+                c for c in filtered_contributors 
+                if c.get("location") and location.lower() in c.get("location", "").lower()
+            ]
+            
+        if language:
+            # We need to join with repositories to get language info
+            try:
+                repos_data = read_csv_file(get_latest_data_files()["repositories_detailed"])
+                repos_by_name = {repo.get("full_name"): repo for repo in repos_data}
+                
+                filtered_contributors = [
+                    c for c in filtered_contributors
+                    if c.get("repository") in repos_by_name and 
+                    repos_by_name[c.get("repository")].get("language", "").lower() == language.lower()
+                ]
+            except Exception as e:
+                logging.error(f"Error filtering by language: {e}")
+                # If we can't load the repositories file, skip language filtering
+                if language:
+                    return {"items": [], "total": 0, "page": page, "page_size": page_size, "total_pages": 0}
+            
+        if min_followers is not None:
+            filtered_contributors = [
+                c for c in filtered_contributors
+                if c.get("followers") and int(c.get("followers", 0)) >= min_followers
+            ]
+            
+        if min_contributions is not None:
+            filtered_contributors = [
+                c for c in filtered_contributors
+                if c.get("total_contributions") and int(c.get("total_contributions", 0)) >= min_contributions
+            ]
+        
+        # Sort the results
+        reverse_sort = sort_order.lower() == "desc"
+        
+        if sort_by == "total_contributions":
+            filtered_contributors.sort(
+                key=lambda x: x.get("total_contributions", 0), 
+                reverse=reverse_sort
+            )
+        elif sort_by == "followers":
+            filtered_contributors.sort(
+                key=lambda x: x.get("followers", 0), 
+                reverse=reverse_sort
+            )
+        elif sort_by == "repositories":
+            # Count repositories per contributor
+            contributor_repos = {}
+            for c in filtered_contributors:
+                username = c.get("username")
+                if username not in contributor_repos:
+                    contributor_repos[username] = set()
+                contributor_repos[username].add(c.get("repository"))
+            
+            filtered_contributors.sort(
+                key=lambda x: len(contributor_repos.get(x.get("username"), set())), 
+                reverse=reverse_sort
+            )
+        
+        # Calculate pagination
+        total = len(filtered_contributors)
+        total_pages = (total + page_size - 1) // page_size
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        
+        # Get the current page of results
+        page_results = filtered_contributors[start_idx:end_idx]
+        
+        # Enhance with repository stars
+        try:
+            repos_data = read_csv_file(get_latest_data_files()["repositories_detailed"])
+            repos_by_name = {repo.get("full_name"): repo for repo in repos_data}
+            
+            for contributor in page_results:
+                repo_name = contributor.get("repository")
+                if repo_name in repos_by_name:
+                    try:
+                        contributor["repository_stars"] = int(repos_by_name[repo_name].get("stargazers_count", 0))
+                    except (ValueError, TypeError):
+                        contributor["repository_stars"] = 0
+                else:
+                    contributor["repository_stars"] = 0
+        except Exception as e:
+            logging.error(f"Error enhancing with repository stars: {e}")
+            # If we can't load the repositories file, set stars to 0
+            for contributor in page_results:
+                contributor["repository_stars"] = 0
+        
+        return {
+            "items": page_results,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages
+        }
+        
+    except Exception as e:
+        logging.exception("Error fetching candidates")
+        raise HTTPException(status_code=500, detail=f"Error fetching candidates: {str(e)}")
+
+@app.get("/api/candidates/languages", response_model=List[Dict[str, Any]])
+async def get_candidate_languages():
+    """Get programming languages used by candidates for filtering."""
+    try:
+        repos_data = read_csv_file(get_latest_data_files()["repositories_detailed"])
+        
+        # Count languages
+        languages = {}
+        for repo in repos_data:
+            lang = repo.get("language")
+            if lang and lang.lower() not in ["null", "none", ""]:
+                if lang not in languages:
+                    languages[lang] = 0
+                languages[lang] += 1
+        
+        # Convert to list of objects
+        language_list = [
+            {"name": lang, "count": count}
+            for lang, count in languages.items()
+        ]
+        
+        # Sort by count (descending)
+        language_list.sort(key=lambda x: x["count"], reverse=True)
+        
+        return language_list
+        
+    except Exception as e:
+        logging.exception("Error fetching candidate languages")
+        raise HTTPException(status_code=500, detail=f"Error fetching candidate languages: {str(e)}")
+
+@app.get("/api/candidates/locations", response_model=List[Dict[str, Any]])
+async def get_candidate_locations():
+    """Get locations of candidates for filtering."""
+    try:
+        contributors_data = read_csv_file(get_latest_data_files()["contributors"])
+        
+        # Count locations
+        locations = {}
+        for contributor in contributors_data:
+            location = contributor.get("location")
+            if location and location.lower() not in ["null", "none", ""]:
+                if location not in locations:
+                    locations[location] = 0
+                locations[location] += 1
+        
+        # Convert to list of objects
+        location_list = [
+            {"name": loc, "count": count}
+            for loc, count in locations.items()
+        ]
+        
+        # Sort by count (descending)
+        location_list.sort(key=lambda x: x["count"], reverse=True)
+        
+        return location_list
+        
+    except Exception as e:
+        logging.exception("Error fetching candidate locations")
+        raise HTTPException(status_code=500, detail=f"Error fetching candidate locations: {str(e)}")
+
+@app.get("/api/debug/file-structure", response_model=Dict[str, Any])
+async def debug_file_structure():
+    """Debug endpoint to check the structure of the data files."""
+    try:
+        files = get_latest_data_files()
+        result = {}
+        
+        for file_type, file_path in files.items():
+            try:
+                # Read the first row to get headers
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    reader = csv.reader(f)
+                    headers = next(reader)
+                    first_row = next(reader, None)
+                
+                result[file_type] = {
+                    "path": file_path,
+                    "headers": headers,
+                    "sample_row": first_row if first_row else []
+                }
+            except Exception as e:
+                result[file_type] = {
+                    "path": file_path,
+                    "error": str(e)
+                }
+        
+        return result
+    except Exception as e:
+        logging.exception("Error in debug endpoint")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+@app.get("/api/debug/contributor/{username}", response_model=Dict[str, Any])
+async def debug_contributor_data(username: str):
+    """Debug endpoint to get raw contributor data."""
+    try:
+        contributors_data = read_csv_file(get_latest_data_files()["contributors"])
+        
+        # Filter contributors by username
+        contributor_entries = [
+            c for c in contributors_data 
+            if c.get("username") == username
+        ]
+        
+        if not contributor_entries:
+            raise HTTPException(status_code=404, detail=f"Contributor {username} not found")
+        
+        # Get the headers from the first entry
+        headers = list(contributor_entries[0].keys())
+        
+        # Extract repository_contributions if present
+        repo_contributions = None
+        if "repository_contributions" in contributor_entries[0]:
+            repo_contributions_raw = contributor_entries[0].get("repository_contributions")
+            try:
+                if isinstance(repo_contributions_raw, str):
+                    repo_contributions = json.loads(repo_contributions_raw)
+            except json.JSONDecodeError:
+                repo_contributions = repo_contributions_raw
+        
+        return {
+            "username": username,
+            "entries_count": len(contributor_entries),
+            "headers": headers,
+            "entries": contributor_entries,
+            "repository_contributions": repo_contributions
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.exception(f"Error fetching debug data for contributor {username}")
+        raise HTTPException(status_code=500, detail=f"Error fetching debug data: {str(e)}")
+
+@app.get("/api/contributors/{username}", response_model=Dict[str, Any])
+async def get_contributor_details(
+    username: str,
+    page: int = Query(1, description="Page number"),
+    page_size: int = Query(20, description="Number of results per page"),
+    sort_by: str = Query("contributions", description="Field to sort by"),
+    sort_order: str = Query("desc", description="Sort order (asc or desc)")
+):
+    """Get detailed information about a contributor and their repositories."""
+    try:
+        logging.info("here0")
+        contributors_data = read_csv_file(get_latest_data_files()["contributors"])
+        
+        # Log the username we're looking for
+        logging.info(f"Looking for contributor with username: {username}")
+        
+        # Filter contributors by username
+        contributor_entries = [
+            c for c in contributors_data 
+            if c.get("username") == username
+        ]
+        
+        # Log how many entries we found
+        logging.info(f"Found {len(contributor_entries)} entries for contributor {username}")
+        
+        if not contributor_entries:
+            raise HTTPException(status_code=404, detail=f"Contributor {username} not found")
+        
+        # Get the contributor profile from the first entry
+        contributor_profile = {k: v for k, v in contributor_entries[0].items() 
+                              if k != "repository" and k != "contributions" and k != "repository_contributions"}
+        
+        # Get all repositories this contributor has contributed to
+        contributor_repos = []
+        
+        # Check for repository_contributions field which contains JSON data
+        for entry in contributor_entries:
+            repo_contributions = entry.get("repository_contributions")
+            if repo_contributions:
+                try:
+                    logging.info("here1")
+                    # Log the raw repository_contributions field
+                    logging.info(f"Raw repository_contributions: {repo_contributions}")
+                    
+                    # Try to parse as JSON
+                    if isinstance(repo_contributions, str):
+                        logging.info("here2")
+                        repo_data_list = json.loads(repo_contributions)
+                        logging.info(f"Successfully parsed repository_contributions as JSON: {repo_data_list}")
+                        
+                        if isinstance(repo_data_list, list):
+                            logging.info("here3")
+                            for repo_data in repo_data_list:
+                                if isinstance(repo_data, dict) and "repository" in repo_data:
+                                    # Ensure contributions is an integer
+                                    contributions = 0
+                                    try:
+                                        logging.info("repo_data")
+                                        logging.info(repo_data)
+                                        # The field is named "contributions" in the JSON
+                                        contributions = int(repo_data.get("contributions", 0))
+                                        logging.info(f"Found contributions: {contributions} for repo {repo_data['repository']}")
+                                    except (ValueError, TypeError):
+                                        pass
+                                    
+                                    # Create repository entry
+                                    repo_entry = {
+                                        "repository": repo_data["repository"],
+                                        "contributions": contributions
+                                    }
+                                    
+                                    # Add additional fields if available
+                                    if "repository_stars" in repo_data:
+                                        repo_entry["stars"] = repo_data["repository_stars"]
+                                    if "repository_language" in repo_data:
+                                        repo_entry["language"] = repo_data["repository_language"]
+                                    
+                                    contributor_repos.append(repo_entry)
+                                    logging.info(f"Added repository from JSON: {repo_data['repository']} with {contributions} contributions")
+                except json.JSONDecodeError as e:
+                    logging.error(f"Error parsing repository_contributions as JSON: {e}")
+                except Exception as e:
+                    logging.error(f"Unexpected error parsing repository_contributions: {e}")
+        
+        # If no repositories found from repository_contributions, try other methods
+        if not contributor_repos:
+            logging.info(f"No repositories found in repository_contributions, trying other methods")
+            
+            # Try to get repositories from the repository field
+            for entry in contributor_entries:
+                repo_name = entry.get("repository")
+                if repo_name:
+                    # Log the repository we found
+                    logging.info(f"Found repository {repo_name} for contributor {username}")
+                    
+                    # Get contributions for this repo
+                    contributions = 0
+                    try:
+                        contributions = int(entry.get("contributions", 0))
+                    except (ValueError, TypeError):
+                        pass
+                    
+                    contributor_repos.append({
+                        "repository": repo_name,
+                        "contributions": contributions
+                    })
+            
+            # If still no repositories, try to fetch from GitHub API
+            if not contributor_repos:
+                logging.info(f"No repositories found in data, trying to fetch from GitHub API")
+                
+                try:
+                    # Fetch repositories from GitHub API
+                    github_token = os.environ.get("GITHUB_TOKEN")
+                    headers = {}
+                    if github_token:
+                        headers["Authorization"] = f"token {github_token}"
+                    
+                    # Make the API request
+                    api_url = f"https://api.github.com/users/{username}/repos?per_page=100&sort=updated"
+                    response = requests.get(api_url, headers=headers)
+                    
+                    if response.status_code == 200:
+                        repos_data = response.json()
+                        
+                        # Process each repository
+                        for repo_data in repos_data:
+                            # Only include repositories owned by the user
+                            if repo_data.get("owner", {}).get("login") == username:
+                                contributor_repos.append({
+                                    "repository": repo_data.get("full_name"),
+                                    "contributions": 0,  # We don't know the exact contributions
+                                    "stars": repo_data.get("stargazers_count", 0),
+                                    "forks": repo_data.get("forks_count", 0),
+                                    "language": repo_data.get("language", ""),
+                                    "description": repo_data.get("description", "")
+                                })
+                        
+                        logging.info(f"Fetched {len(contributor_repos)} repositories from GitHub API")
+                    else:
+                        logging.error(f"Failed to fetch repositories from GitHub API: {response.status_code}")
+                except Exception as e:
+                    logging.error(f"Error fetching repositories from GitHub API: {e}")
+        
+        # If still no repositories, create a dummy entry for the user's own repositories
+        if not contributor_repos and contributor_entries[0].get("total_contributions"):
+            logging.info(f"Creating dummy repository entry for user's own repositories")
+            
+            # Get the total contributions
+            total_contributions = 0
+            try:
+                total_contributions = int(contributor_entries[0].get("total_contributions", 0))
+            except (ValueError, TypeError):
+                pass
+            
+            # Create a dummy repository entry
+            contributor_repos.append({
+                "repository": f"{username}/{username}",
+                "contributions": total_contributions,
+                "stars": 0,
+                "language": "",
+                "description": "User's own repositories"
+            })
+        
+        # Log the total number of repositories found
+        logging.info(f"Total repositories found for {username}: {len(contributor_repos)}")
+        
+        # Ensure numeric fields
+        for repo in contributor_repos:
+            # Ensure contributions is an integer
+            try:
+                repo["contributions"] = int(repo.get("contributions", 0))
+            except (ValueError, TypeError):
+                repo["contributions"] = 0
+            
+            # Ensure stars is an integer
+            if "stars" not in repo:
+                repo["stars"] = 0
+            else:
+                try:
+                    repo["stars"] = int(repo["stars"])
+                except (ValueError, TypeError):
+                    repo["stars"] = 0
+        
+        # Sort the repositories
+        reverse_sort = sort_order.lower() == "desc"
+        
+        if sort_by == "contributions":
+            contributor_repos.sort(
+                key=lambda x: x.get("contributions", 0), 
+                reverse=reverse_sort
+            )
+        elif sort_by == "name":
+            contributor_repos.sort(
+                key=lambda x: x.get("repository", ""), 
+                reverse=reverse_sort
+            )
+        elif sort_by == "stars":
+            contributor_repos.sort(
+                key=lambda x: x.get("stars", 0), 
+                reverse=reverse_sort
+            )
+        
+        # Add repository details if not already present
+        try:
+            repos_data = read_csv_file(get_latest_data_files()["repositories"])
+            repos_by_name = {repo.get("full_name"): repo for repo in repos_data}
+            
+            for repo in contributor_repos:
+                repo_name = repo.get("repository")
+                if repo_name in repos_by_name:
+                    repo_details = repos_by_name[repo_name]
+                    
+                    # Only set these fields if they're not already set
+                    if "stars" not in repo or repo["stars"] == 0:
+                        repo["stars"] = int(repo_details.get("stargazers_count", 0))
+                    
+                    if "forks" not in repo:
+                        repo["forks"] = int(repo_details.get("forks_count", 0))
+                    
+                    if "language" not in repo or not repo["language"]:
+                        repo["language"] = repo_details.get("language", "")
+                    
+                    if "description" not in repo:
+                        repo["description"] = repo_details.get("description", "")
+                else:
+                    if "stars" not in repo:
+                        repo["stars"] = 0
+                    if "forks" not in repo:
+                        repo["forks"] = 0
+                    if "language" not in repo:
+                        repo["language"] = ""
+                    if "description" not in repo:
+                        repo["description"] = ""
+        except Exception as e:
+            logging.error(f"Error adding repository details: {e}")
+        
+        # Calculate pagination
+        total = len(contributor_repos)
+        total_pages = (total + page_size - 1) // page_size if total > 0 else 0
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        
+        # Get the current page of results
+        page_results = contributor_repos[start_idx:end_idx]
+        
+        # Calculate total contributions
+        total_contributions = 0
+        try:
+            # First try to get from the total_contributions field
+            if "total_contributions" in contributor_entries[0]:
+                total_contributions = int(contributor_entries[0].get("total_contributions", 0))
+            else:
+                # Otherwise sum from repositories
+                total_contributions = sum(repo.get("contributions", 0) for repo in contributor_repos)
+        except (ValueError, TypeError):
+            pass
+        
+        contributor_profile["total_contributions"] = total_contributions
+        
+        return {
+            "profile": contributor_profile,
+            "repositories": {
+                "items": page_results,
+                "total": total,
+                "page": page,
+                "page_size": page_size,
+                "total_pages": total_pages
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.exception(f"Error fetching details for contributor {username}")
+        raise HTTPException(status_code=500, detail=f"Error fetching contributor details: {str(e)}")
+
+@app.get("/api/repositories/{repo_name}/contributors", response_model=Dict[str, Any])
+async def get_repository_contributors(
+    repo_name: str,
+    page: int = Query(1, description="Page number"),
+    page_size: int = Query(20, description="Number of results per page"),
+    sort_by: str = Query("contributions", description="Field to sort by"),
+    sort_order: str = Query("desc", description="Sort order (asc or desc)")
+):
+    """Get contributors for a specific repository."""
+    try:
+        contributors_data = read_csv_file(get_latest_data_files()["contributors"])
+        
+        # Filter contributors for this repository
+        repo_contributors = []
+        
+        # First check for direct repository matches
+        for contributor in contributors_data:
+            if contributor.get("repository") == repo_name:
+                repo_contributors.append(contributor)
+        
+        # If no direct matches, check repository_contributions field
+        if not repo_contributors:
+            for contributor in contributors_data:
+                repo_contributions = contributor.get("repository_contributions")
+                if repo_contributions:
+                    try:
+                        # Try to parse as JSON
+                        if isinstance(repo_contributions, str):
+                            repo_data_list = json.loads(repo_contributions)
+                            
+                            if isinstance(repo_data_list, list):
+                                for repo_data in repo_data_list:
+                                    if isinstance(repo_data, dict) and repo_data.get("repository") == repo_name:
+                                        # Create a new contributor entry for this repository
+                                        contributor_entry = {k: v for k, v in contributor.items() 
+                                                           if k != "repository" and k != "contributions" and k != "repository_contributions"}
+                                        
+                                        # Add repository-specific fields
+                                        contributor_entry["repository"] = repo_name
+                                        contributor_entry["contributions"] = repo_data.get("contributions", 0)
+                                        
+                                        repo_contributors.append(contributor_entry)
+                    except json.JSONDecodeError:
+                        pass
+                    except Exception as e:
+                        logging.error(f"Error parsing repository_contributions: {e}")
+        
+        # Ensure numeric fields
+        for contributor in repo_contributors:
+            # Ensure contributions is an integer
+            try:
+                contributor["contributions"] = int(contributor.get("contributions", 0))
+            except (ValueError, TypeError):
+                contributor["contributions"] = 0
+                
+            # Ensure followers is an integer
+            try:
+                contributor["followers"] = int(contributor.get("followers", 0))
+            except (ValueError, TypeError):
+                contributor["followers"] = 0
+        
+        # Sort the results
+        reverse_sort = sort_order.lower() == "desc"
+        
+        if sort_by == "contributions":
+            repo_contributors.sort(
+                key=lambda x: x.get("contributions", 0), 
+                reverse=reverse_sort
+            )
+        elif sort_by == "followers":
+            repo_contributors.sort(
+                key=lambda x: x.get("followers", 0), 
+                reverse=reverse_sort
+            )
+        
+        # Get repository details
+        repo_details = None
+        try:
+            repos_data = read_csv_file(get_latest_data_files()["repositories_detailed"])
+            for repo in repos_data:
+                if repo.get("full_name") == repo_name:
+                    repo_details = repo
+                    break
+        except Exception as e:
+            logging.error(f"Error reading detailed repositories: {e}")
+            
+        if not repo_details:
+            try:
+                repos_data = read_csv_file(get_latest_data_files()["repositories"])
+                for repo in repos_data:
+                    if repo.get("full_name") == repo_name:
+                        repo_details = repo
+                        break
+            except Exception as e:
+                logging.error(f"Error reading repositories: {e}")
+        
+        # Calculate pagination
+        total = len(repo_contributors)
+        total_pages = (total + page_size - 1) // page_size
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        
+        # Get the current page of results
+        page_results = repo_contributors[start_idx:end_idx]
+        
+        return {
+            "repository": repo_details,
+            "contributors": {
+                "items": page_results,
+                "total": total,
+                "page": page,
+                "page_size": page_size,
+                "total_pages": total_pages
+            }
+        }
+        
+    except Exception as e:
+        logging.exception(f"Error fetching contributors for repository {repo_name}")
+        raise HTTPException(status_code=500, detail=f"Error fetching repository contributors: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
