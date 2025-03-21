@@ -36,10 +36,13 @@ class Repository(BaseModel):
     stargazers_count: int
     forks_count: int
     language: Optional[str] = None
-    topics: List[str] = []
+    topics: List[str] = Field(default_factory=list)
     created_at: str
     updated_at: str
     matched_keyword: Optional[str] = None
+    
+    class Config:
+        arbitrary_types_allowed = True
 
 class Contributor(BaseModel):
     username: str
@@ -60,10 +63,11 @@ class Contributor(BaseModel):
     account_type: Optional[str] = Field(None, alias="type")
     site_admin: Optional[bool] = None
     total_contributions: int
-    repository_contributions: List[Dict[str, Any]] = []
+    repository_contributions: Optional[str] = None  # Change to string to match CSV data
     
     class Config:
         allow_population_by_field_name = True
+        arbitrary_types_allowed = True
 
 class DashboardStats(BaseModel):
     total_repositories: int
@@ -183,45 +187,87 @@ async def root():
 
 @app.get("/api/repositories", response_model=List[Repository])
 async def get_repositories(
-    keyword: Optional[str] = None,
-    language: Optional[str] = None,
-    min_stars: Optional[int] = None,
-    limit: int = Query(100, ge=1, le=1000)
+    limit: int = Query(20, description="Number of repositories to return"),
+    offset: int = Query(0, description="Offset for pagination"),
+    sort_by: str = Query("stargazers_count", description="Field to sort by"),
+    sort_order: str = Query("desc", description="Sort order (asc or desc)"),
+    language: Optional[str] = Query(None, description="Filter by programming language"),
+    min_stars: Optional[int] = Query(None, description="Minimum number of stars"),
+    keyword: Optional[str] = Query(None, description="Search keyword in name or description")
 ):
-    """Get repositories with optional filtering."""
+    """Get a list of repositories."""
     try:
-        files = get_latest_data_files()
-        repositories = read_csv_file(files["repositories_detailed"])
+        repositories = read_csv_file(get_latest_data_files()["repositories_detailed"])
         
         # Apply filters
-        if keyword:
-            repositories = [
-                repo for repo in repositories 
-                if keyword.lower() in (repo.get("description") or "").lower() or
-                keyword.lower() in (repo.get("name") or "").lower() or
-                keyword.lower() in (repo.get("matched_keyword") or "").lower()
-            ]
-        
         if language:
             repositories = [
-                repo for repo in repositories 
-                if language.lower() == (repo.get("language") or "").lower()
+                r for r in repositories 
+                if r.get("language") and r.get("language").lower() == language.lower()
             ]
-        
+            
         if min_stars is not None:
             repositories = [
-                repo for repo in repositories 
-                if repo.get("stargazers_count", 0) >= min_stars
+                r for r in repositories
+                if r.get("stargazers_count") and int(r.get("stargazers_count", 0)) >= min_stars
+            ]
+            
+        if keyword:
+            repositories = [
+                r for r in repositories
+                if (r.get("name") and keyword.lower() in r.get("name", "").lower()) or
+                   (r.get("description") and keyword.lower() in r.get("description", "").lower())
             ]
         
-        # Sort by stars (descending)
-        repositories.sort(key=lambda x: x.get("stargazers_count", 0), reverse=True)
+        # Sort the results
+        reverse_sort = sort_order.lower() == "desc"
         
-        return repositories[:limit]
-    
-    except HTTPException:
-        raise
+        if sort_by == "stargazers_count":
+            repositories.sort(
+                key=lambda x: int(x.get("stargazers_count", 0)), 
+                reverse=reverse_sort
+            )
+        elif sort_by == "forks_count":
+            repositories.sort(
+                key=lambda x: int(x.get("forks_count", 0)), 
+                reverse=reverse_sort
+            )
+        elif sort_by == "updated_at":
+            repositories.sort(
+                key=lambda x: x.get("updated_at", ""), 
+                reverse=reverse_sort
+            )
+        
+        # Process topics field for each repository
+        for repo in repositories:
+            # Convert topics from string to list
+            if "topics" in repo:
+                try:
+                    if isinstance(repo["topics"], str):
+                        # If it's a string that looks like a JSON array, parse it
+                        if repo["topics"].startswith("[") and repo["topics"].endswith("]"):
+                            try:
+                                repo["topics"] = json.loads(repo["topics"])
+                            except json.JSONDecodeError:
+                                # If JSON parsing fails, split by commas and strip quotes
+                                topics_str = repo["topics"].strip("[]")
+                                repo["topics"] = [t.strip(' "\'') for t in topics_str.split(",") if t.strip()]
+                        else:
+                            # Otherwise, just use it as a single-item list
+                            repo["topics"] = [repo["topics"]] if repo["topics"] else []
+                except Exception as e:
+                    logging.error(f"Error processing topics for repo {repo.get('full_name')}: {e}")
+                    repo["topics"] = []
+            else:
+                repo["topics"] = []
+        
+        # Apply pagination
+        paginated_repos = repositories[offset:offset+limit]
+        
+        return paginated_repos
+        
     except Exception as e:
+        logging.exception(f"Error fetching repositories: {e}")
         raise HTTPException(status_code=500, detail=f"Error fetching repositories: {str(e)}")
 
 @app.get("/api/contributors", response_model=List[Contributor])
@@ -495,7 +541,12 @@ async def get_extended_stats():
         }
         
         for repo in repositories:
-            size_kb = repo.get("size", 0)
+            # Convert size to integer, handling the case where it's a string
+            try:
+                size_kb = int(repo.get("size", 0))
+            except (ValueError, TypeError):
+                size_kb = 0
+                
             size_mb = size_kb / 1024  # Convert KB to MB
             
             if size_mb < 1:
@@ -534,217 +585,8 @@ async def get_extended_stats():
         }
     
     except Exception as e:
+        logging.exception(f"Error fetching extended stats: {e}")
         raise HTTPException(status_code=500, detail=f"Error fetching extended stats: {str(e)}")
-
-@app.api_route("/api/health", methods=["GET", "HEAD"])
-async def health_check():
-    """Health check endpoint to verify API is running"""
-    return {"status": "ok", "timestamp": datetime.now().isoformat()}
-
-@app.get("/api/candidates", response_model=Dict[str, Any])
-async def get_candidates(
-    sort_by: str = Query("total_contributions", description="Field to sort by"),
-    sort_order: str = Query("desc", description="Sort order (asc or desc)"),
-    page: int = Query(1, description="Page number"),
-    page_size: int = Query(20, description="Number of results per page"),
-    location: Optional[str] = Query(None, description="Filter by location"),
-    language: Optional[str] = Query(None, description="Filter by programming language"),
-    min_followers: Optional[int] = Query(None, description="Minimum number of followers"),
-    min_contributions: Optional[int] = Query(None, description="Minimum number of contributions")
-):
-    """Get candidates (contributors) with sorting and filtering options."""
-    try:
-        contributors_data = read_csv_file(get_latest_data_files()["contributors"])
-        
-        # Map column names to standardized names
-        for contributor in contributors_data:
-            # Map repository_contributions to contributions if it exists
-            # if "repository_contributions" in contributor and not contributor.get("contributions"):
-            #     contributor["contributions"] = contributor["repository_contributions"]
-            
-            # Ensure contributions is an integer
-            try:
-                contributor["total_contributions"] = int(contributor.get("total_contributions", 0))
-            except (ValueError, TypeError):
-                contributor["total_contributions"] = 0
-                
-            # Ensure followers is an integer
-            try:
-                contributor["followers"] = int(contributor.get("followers", 0))
-            except (ValueError, TypeError):
-                contributor["followers"] = 0
-                
-            # Ensure public_repos is an integer
-            try:
-                contributor["public_repos"] = int(contributor.get("public_repos", 0))
-            except (ValueError, TypeError):
-                contributor["public_repos"] = 0
-        
-        # Apply filters
-        filtered_contributors = contributors_data
-        
-        if location:
-            filtered_contributors = [
-                c for c in filtered_contributors 
-                if c.get("location") and location.lower() in c.get("location", "").lower()
-            ]
-            
-        if language:
-            # We need to join with repositories to get language info
-            try:
-                repos_data = read_csv_file(get_latest_data_files()["repositories_detailed"])
-                repos_by_name = {repo.get("full_name"): repo for repo in repos_data}
-                
-                filtered_contributors = [
-                    c for c in filtered_contributors
-                    if c.get("repository") in repos_by_name and 
-                    repos_by_name[c.get("repository")].get("language", "").lower() == language.lower()
-                ]
-            except Exception as e:
-                logging.error(f"Error filtering by language: {e}")
-                # If we can't load the repositories file, skip language filtering
-                if language:
-                    return {"items": [], "total": 0, "page": page, "page_size": page_size, "total_pages": 0}
-            
-        if min_followers is not None:
-            filtered_contributors = [
-                c for c in filtered_contributors
-                if c.get("followers") and int(c.get("followers", 0)) >= min_followers
-            ]
-            
-        if min_contributions is not None:
-            filtered_contributors = [
-                c for c in filtered_contributors
-                if c.get("total_contributions") and int(c.get("total_contributions", 0)) >= min_contributions
-            ]
-        
-        # Sort the results
-        reverse_sort = sort_order.lower() == "desc"
-        
-        if sort_by == "total_contributions":
-            filtered_contributors.sort(
-                key=lambda x: x.get("total_contributions", 0), 
-                reverse=reverse_sort
-            )
-        elif sort_by == "followers":
-            filtered_contributors.sort(
-                key=lambda x: x.get("followers", 0), 
-                reverse=reverse_sort
-            )
-        elif sort_by == "repositories":
-            # Count repositories per contributor
-            contributor_repos = {}
-            for c in filtered_contributors:
-                username = c.get("username")
-                if username not in contributor_repos:
-                    contributor_repos[username] = set()
-                contributor_repos[username].add(c.get("repository"))
-            
-            filtered_contributors.sort(
-                key=lambda x: len(contributor_repos.get(x.get("username"), set())), 
-                reverse=reverse_sort
-            )
-        
-        # Calculate pagination
-        total = len(filtered_contributors)
-        total_pages = (total + page_size - 1) // page_size
-        start_idx = (page - 1) * page_size
-        end_idx = start_idx + page_size
-        
-        # Get the current page of results
-        page_results = filtered_contributors[start_idx:end_idx]
-        
-        # Enhance with repository stars
-        try:
-            repos_data = read_csv_file(get_latest_data_files()["repositories_detailed"])
-            repos_by_name = {repo.get("full_name"): repo for repo in repos_data}
-            
-            for contributor in page_results:
-                repo_name = contributor.get("repository")
-                if repo_name in repos_by_name:
-                    try:
-                        contributor["repository_stars"] = int(repos_by_name[repo_name].get("stargazers_count", 0))
-                    except (ValueError, TypeError):
-                        contributor["repository_stars"] = 0
-                else:
-                    contributor["repository_stars"] = 0
-        except Exception as e:
-            logging.error(f"Error enhancing with repository stars: {e}")
-            # If we can't load the repositories file, set stars to 0
-            for contributor in page_results:
-                contributor["repository_stars"] = 0
-        
-        return {
-            "items": page_results,
-            "total": total,
-            "page": page,
-            "page_size": page_size,
-            "total_pages": total_pages
-        }
-        
-    except Exception as e:
-        logging.exception("Error fetching candidates")
-        raise HTTPException(status_code=500, detail=f"Error fetching candidates: {str(e)}")
-
-@app.get("/api/candidates/languages", response_model=List[Dict[str, Any]])
-async def get_candidate_languages():
-    """Get programming languages used by candidates for filtering."""
-    try:
-        repos_data = read_csv_file(get_latest_data_files()["repositories_detailed"])
-        
-        # Count languages
-        languages = {}
-        for repo in repos_data:
-            lang = repo.get("language")
-            if lang and lang.lower() not in ["null", "none", ""]:
-                if lang not in languages:
-                    languages[lang] = 0
-                languages[lang] += 1
-        
-        # Convert to list of objects
-        language_list = [
-            {"name": lang, "count": count}
-            for lang, count in languages.items()
-        ]
-        
-        # Sort by count (descending)
-        language_list.sort(key=lambda x: x["count"], reverse=True)
-        
-        return language_list
-        
-    except Exception as e:
-        logging.exception("Error fetching candidate languages")
-        raise HTTPException(status_code=500, detail=f"Error fetching candidate languages: {str(e)}")
-
-@app.get("/api/candidates/locations", response_model=List[Dict[str, Any]])
-async def get_candidate_locations():
-    """Get locations of candidates for filtering."""
-    try:
-        contributors_data = read_csv_file(get_latest_data_files()["contributors"])
-        
-        # Count locations
-        locations = {}
-        for contributor in contributors_data:
-            location = contributor.get("location")
-            if location and location.lower() not in ["null", "none", ""]:
-                if location not in locations:
-                    locations[location] = 0
-                locations[location] += 1
-        
-        # Convert to list of objects
-        location_list = [
-            {"name": loc, "count": count}
-            for loc, count in locations.items()
-        ]
-        
-        # Sort by count (descending)
-        location_list.sort(key=lambda x: x["count"], reverse=True)
-        
-        return location_list
-        
-    except Exception as e:
-        logging.exception("Error fetching candidate locations")
-        raise HTTPException(status_code=500, detail=f"Error fetching candidate locations: {str(e)}")
 
 @app.get("/api/debug/file-structure", response_model=Dict[str, Any])
 async def debug_file_structure():
@@ -829,7 +671,6 @@ async def get_contributor_details(
 ):
     """Get detailed information about a contributor and their repositories."""
     try:
-        logging.info("here0")
         contributors_data = read_csv_file(get_latest_data_files()["contributors"])
         
         # Log the username we're looking for
@@ -859,25 +700,20 @@ async def get_contributor_details(
             repo_contributions = entry.get("repository_contributions")
             if repo_contributions:
                 try:
-                    logging.info("here1")
                     # Log the raw repository_contributions field
                     logging.info(f"Raw repository_contributions: {repo_contributions}")
                     
                     # Try to parse as JSON
                     if isinstance(repo_contributions, str):
-                        logging.info("here2")
                         repo_data_list = json.loads(repo_contributions)
                         logging.info(f"Successfully parsed repository_contributions as JSON: {repo_data_list}")
                         
                         if isinstance(repo_data_list, list):
-                            logging.info("here3")
                             for repo_data in repo_data_list:
                                 if isinstance(repo_data, dict) and "repository" in repo_data:
                                     # Ensure contributions is an integer
                                     contributions = 0
                                     try:
-                                        logging.info("repo_data")
-                                        logging.info(repo_data)
                                         # The field is named "contributions" in the JSON
                                         contributions = int(repo_data.get("contributions", 0))
                                         logging.info(f"Found contributions: {contributions} for repo {repo_data['repository']}")
@@ -1215,6 +1051,269 @@ async def get_repository_contributors(
     except Exception as e:
         logging.exception(f"Error fetching contributors for repository {repo_name}")
         raise HTTPException(status_code=500, detail=f"Error fetching repository contributors: {str(e)}")
+
+@app.get("/api/debug/stats-extended", response_model=Dict[str, Any])
+async def debug_extended_stats():
+    """Debug endpoint for extended stats."""
+    try:
+        repositories = read_csv_file(get_latest_data_files()["repositories_detailed"])
+        contributors = read_csv_file(get_latest_data_files()["contributors"])
+        
+        # Get sample data
+        repo_sample = repositories[:5] if repositories else []
+        contrib_sample = contributors[:5] if contributors else []
+        
+        # Check for required fields
+        repo_fields = set()
+        contrib_fields = set()
+        
+        for repo in repo_sample:
+            repo_fields.update(repo.keys())
+        
+        for contrib in contrib_sample:
+            contrib_fields.update(contrib.keys())
+        
+        # Check size field specifically
+        size_types = {}
+        for repo in repositories[:20]:  # Check first 20 repos
+            size_value = repo.get("size")
+            size_type = type(size_value).__name__
+            if size_type not in size_types:
+                size_types[size_type] = []
+            if len(size_types[size_type]) < 3:  # Store up to 3 examples per type
+                size_types[size_type].append(size_value)
+        
+        return {
+            "repository_count": len(repositories),
+            "contributor_count": len(contributors),
+            "repository_fields": sorted(list(repo_fields)),
+            "contributor_fields": sorted(list(contrib_fields)),
+            "repository_sample": repo_sample,
+            "contributor_sample": contrib_sample,
+            "size_field_types": size_types
+        }
+    except Exception as e:
+        logging.exception("Error in debug extended stats endpoint")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+@app.api_route("/api/health", methods=["GET", "HEAD"])
+async def health_check():
+    """Health check endpoint to verify API is running"""
+    return {"status": "ok", "timestamp": datetime.now().isoformat()}
+
+@app.get("/api/candidates", response_model=Dict[str, Any])
+async def get_candidates(
+    page: int = Query(1, description="Page number"),
+    page_size: int = Query(20, description="Number of results per page"),
+    sort_by: str = Query("total_contributions", description="Field to sort by"),
+    sort_order: str = Query("desc", description="Sort order (asc or desc)"),
+    location: Optional[str] = Query(None, description="Filter by location"),
+    language: Optional[str] = Query(None, description="Filter by programming language"),
+    min_followers: Optional[int] = Query(None, description="Minimum number of followers"),
+    min_contributions: Optional[int] = Query(None, description="Minimum number of contributions")
+):
+    """Get a list of candidates (contributors) with pagination and filtering."""
+    try:
+        contributors_data = read_csv_file(get_latest_data_files()["contributors"])
+        
+        # Process each contributor
+        for contributor in contributors_data:
+            # Parse repository_contributions if it's a string
+            if "repository_contributions" in contributor and isinstance(contributor["repository_contributions"], str):
+                try:
+                    # If it's a JSON string, parse it
+                    if contributor["repository_contributions"].startswith("[") and contributor["repository_contributions"].endswith("]"):
+                        contributor["repository_contributions_parsed"] = json.loads(contributor["repository_contributions"])
+                    else:
+                        contributor["repository_contributions_parsed"] = []
+                except json.JSONDecodeError:
+                    contributor["repository_contributions_parsed"] = []
+            else:
+                contributor["repository_contributions_parsed"] = []
+            
+            # Ensure contributions is an integer
+            try:
+                contributor["total_contributions"] = int(contributor.get("total_contributions", 0))
+            except (ValueError, TypeError):
+                contributor["total_contributions"] = 0
+                
+            # Ensure followers is an integer
+            try:
+                contributor["followers"] = int(contributor.get("followers", 0))
+            except (ValueError, TypeError):
+                contributor["followers"] = 0
+                
+            # Ensure public_repos is an integer
+            try:
+                contributor["public_repos"] = int(contributor.get("public_repos", 0))
+            except (ValueError, TypeError):
+                contributor["public_repos"] = 0
+        
+        # Apply filters
+        filtered_contributors = contributors_data
+        
+        if location:
+            filtered_contributors = [
+                c for c in filtered_contributors 
+                if c.get("location") and location.lower() in c.get("location", "").lower()
+            ]
+            
+        if language:
+            # We need to join with repositories to get language info
+            try:
+                repos_data = read_csv_file(get_latest_data_files()["repositories_detailed"])
+                repos_by_name = {repo.get("full_name"): repo for repo in repos_data}
+                
+                filtered_contributors = [
+                    c for c in filtered_contributors
+                    if c.get("repository") in repos_by_name and 
+                    repos_by_name[c.get("repository")].get("language", "").lower() == language.lower()
+                ]
+            except Exception as e:
+                logging.error(f"Error filtering by language: {e}")
+                # If we can't load the repositories file, skip language filtering
+                if language:
+                    return {"items": [], "total": 0, "page": page, "page_size": page_size, "total_pages": 0}
+            
+        if min_followers is not None:
+            filtered_contributors = [
+                c for c in filtered_contributors
+                if c.get("followers") and int(c.get("followers", 0)) >= min_followers
+            ]
+            
+        if min_contributions is not None:
+            filtered_contributors = [
+                c for c in filtered_contributors
+                if c.get("total_contributions") and int(c.get("total_contributions", 0)) >= min_contributions
+            ]
+        
+        # Sort the results
+        reverse_sort = sort_order.lower() == "desc"
+        
+        if sort_by == "total_contributions":
+            filtered_contributors.sort(
+                key=lambda x: x.get("total_contributions", 0), 
+                reverse=reverse_sort
+            )
+        elif sort_by == "followers":
+            filtered_contributors.sort(
+                key=lambda x: x.get("followers", 0), 
+                reverse=reverse_sort
+            )
+        elif sort_by == "repositories":
+            # Count repositories per contributor
+            contributor_repos = {}
+            for c in filtered_contributors:
+                username = c.get("username")
+                if username not in contributor_repos:
+                    contributor_repos[username] = set()
+                contributor_repos[username].add(c.get("repository"))
+            
+            filtered_contributors.sort(
+                key=lambda x: len(contributor_repos.get(x.get("username"), set())), 
+                reverse=reverse_sort
+            )
+        
+        # Calculate pagination
+        total = len(filtered_contributors)
+        total_pages = (total + page_size - 1) // page_size
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        
+        # Get the current page of results
+        page_results = filtered_contributors[start_idx:end_idx]
+        
+        # Enhance with repository stars
+        try:
+            repos_data = read_csv_file(get_latest_data_files()["repositories_detailed"])
+            repos_by_name = {repo.get("full_name"): repo for repo in repos_data}
+            
+            for contributor in page_results:
+                repo_name = contributor.get("repository")
+                if repo_name in repos_by_name:
+                    try:
+                        contributor["repository_stars"] = int(repos_by_name[repo_name].get("stargazers_count", 0))
+                    except (ValueError, TypeError):
+                        contributor["repository_stars"] = 0
+                else:
+                    contributor["repository_stars"] = 0
+        except Exception as e:
+            logging.error(f"Error enhancing with repository stars: {e}")
+            # If we can't load the repositories file, set stars to 0
+            for contributor in page_results:
+                contributor["repository_stars"] = 0
+        
+        return {
+            "items": page_results,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages
+        }
+        
+    except Exception as e:
+        logging.exception("Error fetching candidates")
+        raise HTTPException(status_code=500, detail=f"Error fetching candidates: {str(e)}")
+
+@app.get("/api/candidates/languages", response_model=List[Dict[str, Any]])
+async def get_candidate_languages():
+    """Get programming languages used by candidates for filtering."""
+    try:
+        repos_data = read_csv_file(get_latest_data_files()["repositories_detailed"])
+        
+        # Count languages
+        languages = {}
+        for repo in repos_data:
+            lang = repo.get("language")
+            if lang and lang.lower() not in ["null", "none", ""]:
+                if lang not in languages:
+                    languages[lang] = 0
+                languages[lang] += 1
+        
+        # Convert to list of objects
+        language_list = [
+            {"name": lang, "count": count}
+            for lang, count in languages.items()
+        ]
+        
+        # Sort by count (descending)
+        language_list.sort(key=lambda x: x["count"], reverse=True)
+        
+        return language_list
+        
+    except Exception as e:
+        logging.exception("Error fetching candidate languages")
+        raise HTTPException(status_code=500, detail=f"Error fetching candidate languages: {str(e)}")
+
+@app.get("/api/candidates/locations", response_model=List[Dict[str, Any]])
+async def get_candidate_locations():
+    """Get locations of candidates for filtering."""
+    try:
+        contributors_data = read_csv_file(get_latest_data_files()["contributors"])
+        
+        # Count locations
+        locations = {}
+        for contributor in contributors_data:
+            location = contributor.get("location")
+            if location and location.lower() not in ["null", "none", ""]:
+                if location not in locations:
+                    locations[location] = 0
+                locations[location] += 1
+        
+        # Convert to list of objects
+        location_list = [
+            {"name": loc, "count": count}
+            for loc, count in locations.items()
+        ]
+        
+        # Sort by count (descending)
+        location_list.sort(key=lambda x: x["count"], reverse=True)
+        
+        return location_list
+        
+    except Exception as e:
+        logging.exception("Error fetching candidate locations")
+        raise HTTPException(status_code=500, detail=f"Error fetching candidate locations: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
